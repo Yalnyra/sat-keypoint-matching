@@ -1,4 +1,4 @@
 opencv-python
-numpy
+numpy>=4.5
 matplotlib
 pandas

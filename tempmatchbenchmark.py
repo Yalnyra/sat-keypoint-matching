@@ -8,7 +8,7 @@ import logging
 import os 
 import sys
 import matplotlib.pyplot as plt
-from utils.detection import detect_grid, knn_match
+from utils.detection import detect_grid, detect_window, knn_match, non_max_suppression
 
 # load global logger
 logger = logging.getLogger(__name__)
@@ -98,6 +98,7 @@ if __name__ == "__main__":
     parser.add_argument('--tres', dest='treshold', type=int, help='Minimum good matches to pass the validation test')
     parser.add_argument('--grid', dest='patch_size', type=int, help='Width in pixels of the window in the detection grid')
     parser.add_argument('--pts', dest='max_pts', type=int, help='Maximum number of detection points in a single patch')
+    parser.add_argument('--nms', dest='nms_pts', type=int, help='Maximum number of Non Max Suppression points')
 
 
 
@@ -106,7 +107,8 @@ if __name__ == "__main__":
     parser.set_defaults(treshold=10)
     parser.set_defaults(patch_size=240)
     parser.set_defaults(max_pts=400)
-
+    parser.set_defaults(nms_pts=50)
+    
 
     parser.set_defaults(dpi=96)
 
@@ -160,41 +162,42 @@ if __name__ == "__main__":
                 kp_small = detect_grid(detector, template_img, (args.patch_size,args.patch_size), args.max_pts)
                 kp_big = detect_grid(detector, query_img, (args.patch_size,args.patch_size), args.max_pts)
                 
-                print(f"Total Template image Keypoints: {len(kp_small)}")
-                
-                print(f"Total Query image Keypoints: {len(kp_big)}")
+                nms_kp_small = non_max_suppression(kp_small, args.nms_pts)
+                nms_kp_big = non_max_suppression(kp_big, args.nms_pts)
+
+                print(f"Total Template image Keypoints: {len(kp_small)} \n Non Max Suppression: {len(nms_kp_small)}")
+                print(f"Total Query image Keypoints: {len(kp_big)} \n Non Max Suppression: {len(nms_kp_big)}")
 
                 # Visualize detections
-                kp_small_vis = cv2.drawKeypoints(template_img, kp_small, None, color=(255,0,0), flags=0)
-                kp_big_vis = cv2.drawKeypoints(query_img, kp_big, None, color=(255,0,0), flags=0)
+                kp_small_vis = cv2.drawKeypoints(template_img, nms_kp_small, None, color=(255,0,0), flags=0)
+                kp_big_vis = cv2.drawKeypoints(query_img, nms_kp_big, None, color=(255,0,0), flags=0)
             
-                vis_figure(kp_small_vis, args.template_name, 'detect', det_name, desc_name, args)
-                vis_figure(kp_big_vis, args.query_name, 'detect', det_name, desc_name, args)
-
+                vis_figure(kp_small_vis, args.template_name, 'detect_nms', det_name, desc_name, args)
+                vis_figure(kp_big_vis, args.query_name, 'detect_nms', det_name, desc_name, args)
 
                 # Compute Descriptors
-                _, des_small = extractor.compute(template_img, kp_small)
-                _, des_big = extractor.compute(query_img, kp_big)
+                _, des_small = extractor.compute(template_img, nms_kp_small)
+                _, des_big = extractor.compute(query_img, nms_kp_big)
 
                 if des_small is None or des_big is None:
-                    results.append([det_name, desc_name, len(kp_small), 0, 0, "Fail: No Desc"])
+                    results.append([det_name, desc_name, len(nms_kp_small), 0, 0, "Fail: No Desc"])
                     continue
 
-                # Match
-                good_matches = knn_match(desc_name, des_small, des_big, nn_ratio=0.75)
+                # Match (Added non max suppression)
+                good_matches = knn_match(desc_name, des_small, des_big)
 
                 # Verify Homography (Did it actually work?)
                 status = "Fail"
-                src_pts = np.float32([kp_small[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                dst_pts = np.float32([kp_big[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                M, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, None, cv2.RANSAC, 5.0)
+                src_pts = np.float32([nms_kp_small[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                dst_pts = np.float32([nms_kp_big[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
                 if M is None or len(good_matches) <= args.treshold:
                         
                     end_time = time.time()
                     duration = round(end_time - start_time, 4)
                     
-                    print(f"{det_name:<10} | {desc_name:<10} | {len(kp_small):<10} | {len(good_matches):<8} | {duration:<8} | {status}")
-                    results.append([det_name, desc_name, len(kp_small), len(good_matches), duration, status])
+                    print(f"{det_name:<10} | {desc_name:<10} | {len(nms_kp_small):<10} | {len(good_matches):<8} | {duration:<8} | {status}")
+                    results.append([det_name, desc_name, len(nms_kp_small), len(good_matches), duration, status])
                     continue
 
                 status = "Success"   
@@ -260,8 +263,8 @@ if __name__ == "__main__":
                                     matchesMask = matchesMask, # draw only inliers
                                     flags = 2)
                     ## draw the matches image 
-                    out = cv2.drawMatches(template_img, kp_small,
-                                            query_img, kp_big,
+                    out = cv2.drawMatches(template_img, nms_kp_small,
+                                            query_img, nms_kp_big,
                                             good_matches, 
                                             None, **params)
                     
@@ -270,8 +273,8 @@ if __name__ == "__main__":
                 end_time = time.time()
                 duration = round(end_time - start_time, 4)
                 
-                print(f"{det_name:<10} | {desc_name:<10} | {len(kp_small):<10} | {len(good_matches):<8} | {duration:<8} | {status}")
-                results.append([det_name, desc_name, len(kp_small), len(good_matches), duration, status])
+                print(f"{det_name:<10} | {desc_name:<10} | {len(nms_kp_small):<10} | {len(good_matches):<8} | {duration:<8} | {status}")
+                results.append([det_name, desc_name, len(nms_kp_small), len(good_matches), duration, status])
 
             except Exception as e:
                 print(f"{det_name} + {desc_name} Failed: {e}")

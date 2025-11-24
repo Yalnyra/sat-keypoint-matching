@@ -118,7 +118,16 @@ def get_norm(desc_name):
         return cv2.NORM_HAMMING
     return cv2.NORM_L2
 
-def knn_match(desc_name, des1, des2, nn_ratio=0.7):
+def lowe_test(matches, nn_ratio=0.7):
+    # store only the good matches as per Lowe's ratio test.
+    good = []
+    for m, n in matches:
+        if m.distance < nn_ratio * n.distance:
+            good.append(m)
+
+    return good
+
+def knn_match(desc_name, des1, des2):
   
     # FLANN parameters
     index_params = dict(algorithm = 0, trees = 5)
@@ -136,22 +145,20 @@ def knn_match(desc_name, des1, des2, nn_ratio=0.7):
     # Match features from each image
     matches = flann.knnMatch(des1, des2, k=2)
 
-    # store only the good matches as per Lowe's ratio test.
-    good = []
-    for m, n in matches:
-        if m.distance < nn_ratio * n.distance:
-            good.append(m)
+    if desc_name == 'SIFT':
+        return lowe_test(matches, 0.7)
+    else:
+        return lowe_test(matches, 1.0)
+    
 
-    return good
-
-def non_max_suppression(keypoints, num_to_keep):
+def non_max_suppression(keypoints, max_points=50):
     """
     Implements simplified ANMS (Brown et al.).
     1. Sorts points by response (strength).
     2. For every point, finds the distance to the nearest *stronger* point.
     3. Selects points that have the largest distance to their stronger neighbors.
     """
-    if len(keypoints) <= num_to_keep:
+    if len(keypoints) <= max_points:
         return keypoints
 
     # 1. Extract coordinates and responses
@@ -182,7 +189,7 @@ def non_max_suppression(keypoints, num_to_keep):
         radii[i] = np.min(dist_sq)
 
     # Select top k points with the largest suppression radii
-    best_indices = np.argsort(radii)[::-1][:num_to_keep]
+    best_indices = np.argsort(radii)[::-1][:max_points]
     
     # Map back to original keypoint objects
     keep_indices = original_indices[best_indices]
@@ -236,7 +243,4 @@ def opponent_desc(extractor, channels, kps):
     if des1 is None or des2 is None or des3 is None:
         return None
 
-    # Concatenate horizontally (Feature Fusion)
-    # SIFT: 128 -> 384 dims
-    # ORB: 32 -> 96 bytes
     return np.hstack([des1, des2, des3])
