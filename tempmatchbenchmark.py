@@ -59,12 +59,10 @@ def detect_patch(detector, img_patch, offset_x, offset_y, max_pts):
         
     return kps
 
-def detect_grid(detector, img_gray, patch_size=(4,4), max_pts=200):
+def detect_window(detector, img_gray, patch_size=(4,4), max_pts=200, min_valid=0.1):
     """
-    1. Splits image into RGB channels.
-    2. Splits each channel into grid tiles.
-    3. Detects on every tile of every channel.
-    4. Fuses results.
+    Detect fixed window
+    
     """
     h, w = img_gray.shape[:2]
     patch_h, patch_w = patch_size
@@ -90,14 +88,63 @@ def detect_grid(detector, img_gray, patch_size=(4,4), max_pts=200):
             
             x_start = x_margin + (c * patch_w)
             x_end = x_start + patch_w
-            
             # Extract the specific patch from the specific channel
             patch = img_gray[y_start:y_end, x_start:x_end]
+            
+            # Calculate ratio of valid (non-zero) pixels
+            # This assumes mask is binary (0 for invalid, >0 for valid)
+            valid_pixels = np.count_nonzero(patch)
+            total_pixels = patch_h * patch_w
+            
+            if (valid_pixels / total_pixels) < min_valid:
+                continue # Skip this patch
+                    
+            
             
             # Detect (pass absolute coordinates x_start/y_start for global mapping)
             patch_kps = detect_patch(detector, patch, x_start, y_start, max_pts)
             all_kps.extend(patch_kps)
     return all_kps
+
+def detect_grid(detector, img_gray, grid_size=(4,4), max_pts=200, min_valid=0.1):
+        """
+        1. Splits image into RGB channels.
+        2. Splits each channel into grid tiles.
+        3. Detects on every tile of every channel.
+        4. Fuses results.
+        """
+        all_kps = []
+        grid_rows, grid_cols = grid_size
+        h, w = img_gray.shape[:2]
+        
+        # Calculate cell dimensions
+        step_h = h // grid_rows
+        step_w = w // grid_cols
+        
+        # --- ITERATE OVER GRID ---
+        for r in range(grid_rows):
+            for c in range(grid_cols):
+                # Define patch coordinates
+                y_start, y_end = r * step_h, (r + 1) * step_h
+                x_start, x_end = c * step_w, (c + 1) * step_w
+
+                patch = img_gray[y_start:y_end, x_start:x_end]
+                # --- VALIDITY CHECK ---
+                # Calculate ratio of valid (non-zero) pixels
+                # This assumes mask is binary (0 for invalid, >0 for valid)
+                valid_pixels = np.count_nonzero(patch)
+                total_pixels = step_h * step_w
+                
+                if (valid_pixels / total_pixels) < min_valid:
+                    continue # Skip this patch
+
+                
+                
+                # Detect (pass absolute coordinates x_start/y_start for global mapping)
+                patch_kps = detect_patch(detector, patch, x_start, y_start, max_pts)
+                all_kps.extend(patch_kps)
+
+        return all_kps
 
 def opponent_desc(extractor, channels, kps):
     """
@@ -235,8 +282,10 @@ if __name__ == "__main__":
     parser.add_argument('-v', dest='verbosity', action='store_true', help='Increase output verbosity')
     parser.add_argument('-p', dest='photocopied', action='store_true', help='Use only if the image is scanned or photocopied, do not with photos!')
     parser.add_argument('--matches', dest='view_matches', action='store_true', help="Shows the matching result and the good matches")
-    parser.add_argument('--tres', dest='treshold', help='Minimum good matches to pass the validation test')
-    parser.add_argument('--grid', dest='patch_size', help='Width in pixels of the window in the detection grid')
+    parser.add_argument('--tres', dest='treshold', type=int, help='Minimum good matches to pass the validation test')
+    parser.add_argument('--grid', dest='patch_size', type=int, help='Width in pixels of the window in the detection grid')
+    parser.add_argument('--pts', dest='max_pts', type=int, help='Maximum number of detection points in a single patch')
+
 
 
     parser.set_defaults(view_matches=False)
@@ -254,7 +303,7 @@ if __name__ == "__main__":
             # 'SIFT': cv2.SIFT_create(nfeatures=2000),
             'ORB': cv2.ORB_create(nfeatures=2000),
             'BRISK': cv2.BRISK_create(),
-            'AKAZE': cv2.AKAZE_create(),
+            # 'AKAZE': cv2.AKAZE_create(),
             # 'FAST': cv2.FastFeatureDetector_create(threshold=20),
             'GFTT': cv2.GFTTDetector_create(maxCorners=2000) # Shi-Tomasi
         }
@@ -262,9 +311,9 @@ if __name__ == "__main__":
     # Note: FAST and GFTT are NOT descriptors, so they aren't in this list.
     descriptors = {
         'SIFT': cv2.SIFT_create(),
-        # 'ORB': cv2.ORB_create(),
-        # 'BRISK': cv2.BRISK_create(),
-        'AKAZE': cv2.AKAZE_create()
+        'ORB': cv2.ORB_create(),
+        'BRISK': cv2.BRISK_create(),
+        # 'AKAZE': cv2.AKAZE_create()
     }
 
     results = []
@@ -300,7 +349,7 @@ if __name__ == "__main__":
                 
                 print(f"Total Template image Keypoints: {len(kp_small)}")
                 
-                print(f"Total Query image Keypoints: {len(kp_small)}")
+                print(f"Total Query image Keypoints: {len(kp_big)}")
 
                 # Visualize detections
                 kp_small_vis = cv2.drawKeypoints(template_img, kp_small, None, color=(255,0,0), flags=0)
@@ -319,13 +368,13 @@ if __name__ == "__main__":
                     continue
 
                 # Match
-                good_matches = knn_match(desc_name, des_small, des_big, nn_ratio=0.7)
+                good_matches = knn_match(desc_name, des_small, des_big, nn_ratio=0.75)
 
                 # Verify Homography (Did it actually work?)
                 status = "Fail"
                 src_pts = np.float32([kp_small[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
                 dst_pts = np.float32([kp_big[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                M, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, None, cv2.RANSAC, 5.0)
                 if M is None or len(good_matches) <= args.treshold:
                         
                     end_time = time.time()
@@ -415,5 +464,7 @@ if __name__ == "__main__":
                 print(f"{det_name} + {desc_name} Failed: {e}")
                     
     df = pd.DataFrame(results, columns=["Detector", "Descriptor", "KP_Count", "Good_Matches", "Time", "Status"])
+    df = df.sort_values(by="Good_Matches", ascending=False)
     print("\nSummary Sorted by Matches:")
-    df.sort_values(by="Good_Matches", ascending=False).to_csv('{}/report.csv'.format(args.output_path))
+    print(df)
+    df.to_csv('{}/report.csv'.format(args.output_path))
