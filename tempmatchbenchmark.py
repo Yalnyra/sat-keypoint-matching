@@ -14,6 +14,113 @@ import matplotlib.pyplot as plt
 logger = logging.getLogger(__name__)
 logging.basicConfig(format='%(asctime)s %(message)s')
 
+def to_opponent_space(img_bgr):
+    """
+    Converts BGR image to Opponent Color Space (O1, O2, O3).
+    Returns 3 separate UINT8 images safe for ORB/BRISK/AKAZE.
+    """
+    img_bgr = img_bgr.astype(np.float32)
+    B, G, R = cv2.split(img_bgr)
+
+    # --- Mathematical Conversion ---
+    # O1 = (R - G) / sqrt(2)
+    # O2 = (R + G - 2B) / sqrt(6)
+    # O3 = (R + G + B) / sqrt(3)  <-- Intensity/Grayscale
+    
+    O1 = (R - G) / np.sqrt(2)
+    O2 = (R + G - 2*B) / np.sqrt(6)
+    O3 = (R + G + B) / np.sqrt(3)
+
+    # --- Normalization to 0-255 (Uint8) ---
+    # Necessary because ORB/BRISK cannot read negative floats
+    # O1 range approx [-180, 180] -> Shift + Scale
+    O1 = cv2.normalize(O1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    O2 = cv2.normalize(O2, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    O3 = cv2.normalize(O3, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    return [O1, O2, O3]
+
+def detect_patch(detector, img_patch, offset_x, offset_y, max_pts):
+    """
+    Runs detection on a specific image patch and shifts coordinates 
+    back to global image space.
+    """
+    kps = detector.detect(img_patch, None)
+    
+    # Sort by response strength (strongest first)
+    kps = sorted(kps, key=lambda x: x.response, reverse=True)
+    
+    # Cap the number of points (Prevention of "Clumping")
+    kps = kps[:max_pts]
+    
+    # Adjust coordinates to global space
+    for kp in kps:
+        kp.pt = (kp.pt[0] + offset_x, kp.pt[1] + offset_y)
+        
+    return kps
+
+def detect_grid(detector, img_gray, patch_size=(4,4), max_pts=200):
+    """
+    1. Splits image into RGB channels.
+    2. Splits each channel into grid tiles.
+    3. Detects on every tile of every channel.
+    4. Fuses results.
+    """
+    h, w = img_gray.shape[:2]
+    patch_h, patch_w = patch_size
+    
+    # How many full patches fit?
+    n_rows = h // patch_h
+    n_cols = w // patch_w
+    
+    # Calculate centered starting points (splitting the residual)
+    # If 50px remain, we start at index 25.
+    y_margin = (h - (n_rows * patch_h)) // 2
+    x_margin = (w - (n_cols * patch_w)) // 2
+    
+    all_kps = []
+
+    # img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_RGB2GRAY)  
+    # --- ITERATE OVER GRID ---
+    for r in range(n_rows):
+        for c in range(n_cols):
+            # Calculate coordinates with margin offset
+            y_start = y_margin + (r * patch_h)
+            y_end = y_start + patch_h
+            
+            x_start = x_margin + (c * patch_w)
+            x_end = x_start + patch_w
+            
+            # Extract the specific patch from the specific channel
+            patch = img_gray[y_start:y_end, x_start:x_end]
+            
+            # Detect (pass absolute coordinates x_start/y_start for global mapping)
+            patch_kps = detect_patch(detector, patch, x_start, y_start, max_pts)
+            all_kps.extend(patch_kps)
+    return all_kps
+
+def opponent_desc(extractor, channels, kps):
+    """
+    Computes descriptors on all 3 channels and concatenates them.
+    """
+    # If no keypoints detected, return None
+    if len(kps) == 0:
+        return None
+
+    # Compute individually
+    # Note: We rely on the extractor's compute method
+    _, des1 = extractor.compute(channels[0], kps)
+    _, des2 = extractor.compute(channels[1], kps)
+    _, des3 = extractor.compute(channels[2], kps)
+
+    # Handle edge case where compute fails for some channels
+    if des1 is None or des2 is None or des3 is None:
+        return None
+
+    # Concatenate horizontally (Feature Fusion)
+    # SIFT: 128 -> 384 dims
+    # ORB: 32 -> 96 bytes
+    return np.hstack([des1, des2, des3])
 
 def get_norm(desc_name):
     # Binary descriptors need HAMMING, Floats need L2
@@ -21,24 +128,31 @@ def get_norm(desc_name):
         return cv2.NORM_HAMMING
     return cv2.NORM_L2
 
-def knn_match(des1, des2, nn_ratio=0.7):
+def knn_match(desc_name, des1, des2, nn_ratio=0.7):
   
-  # FLANN parameters
-  index_params = dict(algorithm = 0, trees = 5)
-  search_params = dict(checks = 50)
+    # FLANN parameters
+    index_params = dict(algorithm = 0, trees = 5)
+    search_params = dict(checks = 50)
 
-  flann = cv2.FlannBasedMatcher(index_params, search_params)
-  
-  # Match features from each image
-  matches = flann.knnMatch(des1, des2, k=2)
+    norm = get_norm(desc_name)
+    # Configure Matcher
+    if norm == cv2.NORM_HAMMING:
+        index_params = dict(algorithm=6, table_number=6, key_size=12, multi_probe_level=1)
+    else:
+        index_params = dict(algorithm=1, trees=5)
 
-  # store only the good matches as per Lowe's ratio test.
-  good = []
-  for m, n in matches:
-    if m.distance < nn_ratio * n.distance:
-      good.append(m)
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+    
+    # Match features from each image
+    matches = flann.knnMatch(des1, des2, k=2)
 
-  return good
+    # store only the good matches as per Lowe's ratio test.
+    good = []
+    for m, n in matches:
+        if m.distance < nn_ratio * n.distance:
+            good.append(m)
+
+    return good
 
 # calculate the angle with the horizontal
 def angle_horizontal(v):
@@ -57,6 +171,60 @@ def knn_clasif(good_matches):
     logger.info('p(t_{} | x) = {:.4f}'.format(i, logprob))
   return best_template
 
+def vis_figure(img, base, name, det_name, desc_name, args, patch_size=None, draw_grid=False):
+    bn, ext = os.path.splitext(os.path.basename(base))
+    
+    # Handling input type variations (assuming img might be a class or array)
+    if hasattr(img, 'shape'):
+        h_graph, w_graph = img.shape[:2]
+    else:
+        # Fallback if 'img' is a custom object as implied by your snippet
+        h_graph, w_graph = img.img.shape[:2]
+
+    # Create figure
+    plt.figure(figsize=(w_graph / args.dpi, h_graph / args.dpi), dpi=args.dpi)
+    
+    # Display the main image
+    # Note: 'out' was undefined in your snippet, assuming 'img' or 'out' is the target
+    image_to_show = img.img if hasattr(img, 'img') else img
+    plt.imshow(image_to_show, 'gray')
+
+    # --- GRID DRAWING LOGIC ---
+    if draw_grid and patch_size is not None:
+        ph, pw = patch_size
+        
+        # Re-calculate the grid logic to know where to draw lines
+        n_rows = h_graph // ph
+        n_cols = w_graph // pw
+        
+        y_margin = (h_graph - (n_rows * ph)) // 2
+        x_margin = (w_graph - (n_cols * pw)) // 2
+        
+        # Calculate grid boundaries
+        grid_top = y_margin
+        grid_bottom = y_margin + (n_rows * ph)
+        grid_left = x_margin
+        grid_right = x_margin + (n_cols * pw)
+
+        # Define Line Positions
+        # x_lines: Start at left margin, step by patch width, up to right margin
+        x_lines = [x_margin + (i * pw) for i in range(n_cols + 1)]
+        # y_lines: Start at top margin, step by patch height, up to bottom margin
+        y_lines = [y_margin + (i * ph) for i in range(n_rows + 1)]
+
+        # Draw Vertical Lines (Red) - Constrained between top and bottom of grid
+        plt.vlines(x=x_lines, ymin=grid_top, ymax=grid_bottom, colors='r', linewidth=1)
+
+        # Draw Horizontal Lines (Red) - Constrained between left and right of grid
+        plt.hlines(y=y_lines, xmin=grid_left, xmax=grid_right, colors='r', linewidth=1)
+
+    # Save logic
+    logger.info('Saving full image in {}/{}_fix{}'.format(args.output_path, bn, ext))
+    plt.axis('off') # Optional: removes axis ticks for cleaner image
+    plt.tight_layout(pad=0)
+    plt.savefig('{}/{}_{}_{}_{}{}'.format(args.output_path, bn, name, det_name, desc_name, ext))
+    plt.close()
+
 
 
 if __name__ == "__main__":
@@ -65,28 +233,37 @@ if __name__ == "__main__":
     parser.add_argument('-q', dest='query_name', required=True, help='Query image')
     parser.add_argument('-o', dest='output_path', help='Output directory', default='.')
     parser.add_argument('-v', dest='verbosity', action='store_true', help='Increase output verbosity')
+    parser.add_argument('-p', dest='photocopied', action='store_true', help='Use only if the image is scanned or photocopied, do not with photos!')
     parser.add_argument('--matches', dest='view_matches', action='store_true', help="Shows the matching result and the good matches")
+    parser.add_argument('--tres', dest='treshold', help='Minimum good matches to pass the validation test')
+    parser.add_argument('--grid', dest='patch_size', help='Width in pixels of the window in the detection grid')
+
 
     parser.set_defaults(view_matches=False)
     parser.set_defaults(photocopied=False)
+    parser.set_defaults(treshold=10)
+    parser.set_defaults(patch_size=240)
+    parser.set_defaults(max_pts=400)
+
+
+    parser.set_defaults(dpi=96)
 
     args = parser.parse_args()
 
     detectors = {
-            'SIFT': cv2.SIFT_create(nfeatures=2000),
+            # 'SIFT': cv2.SIFT_create(nfeatures=2000),
             'ORB': cv2.ORB_create(nfeatures=2000),
             'BRISK': cv2.BRISK_create(),
             'AKAZE': cv2.AKAZE_create(),
-            'FAST': cv2.FastFeatureDetector_create(threshold=20),
+            # 'FAST': cv2.FastFeatureDetector_create(threshold=20),
             'GFTT': cv2.GFTTDetector_create(maxCorners=2000) # Shi-Tomasi
         }
 
-    # --- 2. Define Descriptors ---
     # Note: FAST and GFTT are NOT descriptors, so they aren't in this list.
     descriptors = {
         'SIFT': cv2.SIFT_create(),
-        'ORB': cv2.ORB_create(),
-        'BRISK': cv2.BRISK_create(),
+        # 'ORB': cv2.ORB_create(),
+        # 'BRISK': cv2.BRISK_create(),
         'AKAZE': cv2.AKAZE_create()
     }
 
@@ -100,6 +277,8 @@ if __name__ == "__main__":
         print("Error: Could not load images.")
         sys.exit()
 
+    
+    # Standard screen DPI (Dots Per Inch) is usually 96. 
     print(f"{'Detector':<10} | {'Descriptor':<10} | {'KP (Small)':<10} | {'Matches':<8} | {'Time (s)':<8} | {'Status'}")
     print("-" * 70)
 
@@ -109,18 +288,29 @@ if __name__ == "__main__":
             
             # Skip incompatible combinations
             # AKAZE Descriptor only works with AKAZE Keypoints (usually)
-            if desc_name == 'AKAZE' and det_name != 'AKAZE':
+            if desc_name == 'AKAZE' and det_name != desc_name:
                 continue
                 
             try:
                 start_time = time.time()
                 
-                # A. Detect Keypoints
-                kp_small = detector.detect(template_img, None)
-                kp_big = detector.detect(query_img, None)
+                # Detect Keypoints
+                kp_small = detect_grid(detector, template_img, (args.patch_size,args.patch_size), args.max_pts)
+                kp_big = detect_grid(detector, query_img, (args.patch_size,args.patch_size), args.max_pts)
                 
-                # B. Compute Descriptors
-                # Note: We use the 'extractor' object here, not the detector
+                print(f"Total Template image Keypoints: {len(kp_small)}")
+                
+                print(f"Total Query image Keypoints: {len(kp_small)}")
+
+                # Visualize detections
+                kp_small_vis = cv2.drawKeypoints(template_img, kp_small, None, color=(255,0,0), flags=0)
+                kp_big_vis = cv2.drawKeypoints(query_img, kp_big, None, color=(255,0,0), flags=0)
+            
+                vis_figure(kp_small_vis, args.template_name, 'detect', det_name, desc_name, args)
+                vis_figure(kp_big_vis, args.query_name, 'detect', det_name, desc_name, args)
+
+
+                # Compute Descriptors
                 _, des_small = extractor.compute(template_img, kp_small)
                 _, des_big = extractor.compute(query_img, kp_big)
 
@@ -128,31 +318,15 @@ if __name__ == "__main__":
                     results.append([det_name, desc_name, len(kp_small), 0, 0, "Fail: No Desc"])
                     continue
 
-                # C. Match
-                norm = get_norm(desc_name)
-                
-                # Configure Matcher
-                if norm == cv2.NORM_HAMMING:
-                    index_params = dict(algorithm=6, table_number=6, key_size=12, multi_probe_level=1)
-                else:
-                    index_params = dict(algorithm=1, trees=5)
-                    
-                matcher = cv2.FlannBasedMatcher(index_params, dict(checks=50))
-                matches = matcher.knnMatch(des_small, des_big, k=2)
+                # Match
+                good_matches = knn_match(desc_name, des_small, des_big, nn_ratio=0.7)
 
-                # D. Filter (Ratio Test)
-                good_matches = []
-                ratio = 0.75 if norm == cv2.NORM_HAMMING else 0.7
-                for m, n in matches:
-                    if m.distance < ratio * n.distance:
-                        good_matches.append(m)
-
-                # E. Verify Homography (Did it actually work?)
+                # Verify Homography (Did it actually work?)
                 status = "Fail"
                 src_pts = np.float32([kp_small[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
                 dst_pts = np.float32([kp_big[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
                 M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-                if M is None or len(good_matches) <= 10:
+                if M is None or len(good_matches) <= args.treshold:
                         
                     end_time = time.time()
                     duration = round(end_time - start_time, 4)
@@ -179,7 +353,7 @@ if __name__ == "__main__":
                 dst = cv2.perspectiveTransform(pts,M)
 
                 if args.photocopied:
-                    logger.info('Simplifying transformation matrix ...'.format(template_img_path))
+                    logger.info('Simplifying transformation matrix ...'.format(args.template_name))
                     # if the image is a photocopy or scanned we can assume that there is no shear in x or y.
                     # Thus we can simplify the transformation matrix M with only: rotation, scale and tranlation.
 
@@ -211,11 +385,9 @@ if __name__ == "__main__":
                 
                 # if bounding boxes are provided and we only have one template
                 # crop those bounding boxes
-                bn, ext = os.path.splitext(os.path.basename(template_img_path))
                 # using M^{-1} we go from query coordinates to template coordinates.
                 img_templ_coords = cv2.warpPerspective(query_img, np.linalg.inv(M), (w,h))
-                logger.info('Saving full image in {}/{}_fix{}'.format(args.output_path, bn, ext))
-                cv2.imwrite('{}/{}_fix{}'.format(args.output_path, bn, ext), img_templ_coords)
+                vis_figure(img_templ_coords, args.template_name, 'reproject', det_name, desc_name, args)
 
                 if args.view_matches:
                     # draw the rectangle in the image
@@ -230,22 +402,8 @@ if __name__ == "__main__":
                                             query_img, kp_big,
                                             good_matches, 
                                             None, **params)
-                    ## show result
-                    # --- START EDIT ---
-                    # Calculate the dimensions of the combined image (template + query)
-                    h_graph, w_graph = out.shape[:2]
                     
-                    # Standard screen DPI (Dots Per Inch) is usually 96. 
-                    # We convert pixels to inches for Matplotlib: inches = pixels / dpi
-                    dpi = 96 
-                    
-                    # Create a figure that matches the pixel resolution of the output image
-                    plt.figure(figsize=(w_graph / dpi, h_graph / dpi), dpi=dpi)
-                    # --- END EDIT ---
-                    ## show result
-                    plt.imshow(out, 'gray')
-                    plt.savefig('{}/{}_match_{}_{}{}'.format(args.output_path, bn, det_name, desc_name, ext), img_templ_coords)
-                    plt.show()
+                    vis_figure(out, args.template_name, 'match', det_name, desc_name, args)
                 
                 end_time = time.time()
                 duration = round(end_time - start_time, 4)
