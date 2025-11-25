@@ -9,7 +9,7 @@ import logging
 import os 
 import sys
 import matplotlib.pyplot as plt
-from utils.detection import detect_grid, detect_window, non_max_suppression, lowe_test
+from utils.detection import detect_grid, detect_window, non_max_suppression, lowe_test, to_opponent_space, opponent_desc
 from utils.config import init_pipeline
 from utils.metrics import box_iou
 
@@ -81,12 +81,14 @@ if __name__ == "__main__":
     parser.add_argument('-v', dest='verbosity', action='store_true', help='Increase output verbosity')
     parser.add_argument('-p', dest='photocopied', action='store_true', help='Removes shear from affine2d transform, Use only if the image is scanned')
     parser.add_argument('--matches', dest='view_matches', action='store_true', help="Shows the matching result and the good matches")
+    parser.add_argument('--rgb', dest='match_rgb', action='store_true', help="Extract multichannel features in RGB space instead of grayscale")
     parser.add_argument('--tres', dest='treshold', type=int, help='Minimum good matches to pass the validation test')
     parser.add_argument('--grid', dest='patch_size', type=int, help='Width in pixels of the window in the detection grid')
     parser.add_argument('--pts', dest='max_pts', type=int, help='Maximum number of detection points in a single patch')
     parser.add_argument('--nms', dest='nms_pts', type=int, help='Maximum number of Non Max Suppression points')
 
     parser.set_defaults(view_matches=False)
+    parser.set_defaults(match_rgb=False)
     parser.set_defaults(photocopied=False)
     parser.set_defaults(treshold=10)
     parser.set_defaults(patch_size=240)
@@ -95,6 +97,7 @@ if __name__ == "__main__":
     parser.set_defaults(dpi=96)
 
     args = parser.parse_args()
+
 
     
     # --- GROUND TRUTH CONFIGURATION ---
@@ -145,13 +148,7 @@ if __name__ == "__main__":
                 'params': {
                     'nfeatures': 2000
                 }
-            },
-            'STAR': {
-                'factory': cv2.xfeatures2d.StarDetector,
-                'params': {
-                    'suppressNonmaxSize': args.nms_pts
-                }
-            },
+            }
         },
         'descriptor':{
             'ORB': {
@@ -169,26 +166,34 @@ if __name__ == "__main__":
             'SIFT': {
                 'factory': cv2.SIFT_create,
                 'params': {}
-            },
-            'FREAK':{
-                'factory': cv2.xfeatures2d.FREAK,
-                'params': {}
             }
         }
     }
 
 
-    detectors = ['GFTT','ORB', 'BRISK', 'AKAZE', 'GFFT'] # ,'AKAZE', 'FAST', 'SIFT'
+    detectors = ['GFTT','ORB', 'BRISK'] # ,'AKAZE', 'FAST', 'SIFT'
     # FAST and GFTT are NOT descriptors
-    descriptors = ['ORB', 'BRISK', 'AKAZE']  # 'FREAK', 'AKAZE'
+    descriptors = ['ORB', 'BRISK', 'SIFT']  # 'FREAK', 'AKAZE'
     matchers = ['BF', 'FLANN']
     match_name = 'FLANN'
     
     results = []
     
     # Load Images
-    query_img = cv2.imread(args.query_name, cv2.IMREAD_GRAYSCALE)
-    template_img = cv2.imread(args.template_name, cv2.IMREAD_GRAYSCALE)
+    if args.match_rgb:
+        query_img = cv2.imread(args.query_name, cv2.IMREAD_COLOR_RGB)
+        template_img = cv2.imread(args.template_name, cv2.IMREAD_COLOR_RGB)
+
+        query_channels = to_opponent_space(query_img) 
+        template_channels = to_opponent_space(template_img)
+    else:
+        query_img = cv2.imread(args.query_name, cv2.IMREAD_GRAYSCALE)
+        template_img = cv2.imread(args.template_name, cv2.IMREAD_GRAYSCALE)
+
+        query_channels = [query_img]
+        template_channels = [template_img]
+
+    
     
     if query_img is None or template_img is None:
         print("Error: Could not load images.")
@@ -211,8 +216,8 @@ if __name__ == "__main__":
                 start_time = time.time()
                 
                 # Detect Keypoints
-                kp_small = detect_grid(detector, template_img, (args.patch_size,args.patch_size), args.max_pts)
-                kp_big = detect_grid(detector, query_img, (args.patch_size,args.patch_size), args.max_pts)
+                kp_small = detect_grid(detector, template_channels, (args.patch_size,args.patch_size), args.max_pts)
+                kp_big = detect_grid(detector, query_channels, (args.patch_size,args.patch_size), args.max_pts)
                 
                 nms_kp_small = non_max_suppression(kp_small, args.nms_pts)
                 nms_kp_big = non_max_suppression(kp_big, args.nms_pts)
@@ -228,8 +233,12 @@ if __name__ == "__main__":
                 vis_figure(kp_big_vis, args.query_name, 'detect_nms', det_name, desc_name, args)
 
                 # Compute Descriptors
-                _, des_small = extractor.compute(template_img, nms_kp_small)
-                _, des_big = extractor.compute(query_img, nms_kp_big)
+                if args.match_rgb:
+                    des_small = opponent_desc(extractor, template_channels, nms_kp_small)
+                    des_big = opponent_desc(extractor, query_channels, nms_kp_big)
+                else:
+                    _, des_small = extractor.compute(template_img, nms_kp_small)
+                    _, des_big = extractor.compute(query_img, nms_kp_big)
 
                 if des_small is None or des_big is None:
                     results.append([det_name, desc_name, len(nms_kp_small), 0, 0, "Fail: No Desc"])
@@ -247,12 +256,12 @@ if __name__ == "__main__":
                 status = "Fail"
                 src_pts = np.float32([nms_kp_small[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
                 dst_pts = np.float32([nms_kp_big[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                M, mask = cv2.estimateAffine2D(src_pts, dst_pts, None, cv2.RANSAC, 5.0)
+                M, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, None, cv2.RANSAC, 5.0)
                 if M is None or len(good_matches) <= args.treshold:
                         
                     end_time = time.time()
                     duration = round(end_time - start_time, 4)
-  
+
                     print(f"{det_name:<10} | {desc_name:<10} | nan | nan | nan | nan | {len(kp_small):<10} | {len(good_matches):<8} | {duration:<8} | {status}")
                     results.append([det_name, desc_name, np.nan, np.nan, np.nan, np.nan, len(nms_kp_small), len(good_matches), duration, status])
                     continue
@@ -265,7 +274,7 @@ if __name__ == "__main__":
                 M = np.vstack((M, row_to_add))
 
                 # Calculate the rectangle enclosing the query image
-                h,w = template_img.shape
+                h,w = template_img.shape[:2]
 
                 # Define the rectangle in the coordinates of the template image
                 pts = np.float32([[0,0],[0,h-1],[w-1,h-1],[w-1,0]]).reshape(-1,1,2)
@@ -337,7 +346,7 @@ if __name__ == "__main__":
                     area_ratio = round(template_area / projected_area, 3)
                 
                 # --- Visualization ---
-                img_bbox = cv2.cvtColor(query_img, cv2.COLOR_GRAY2RGB)
+                img_bbox = cv2.cvtColor(query_img, cv2.COLOR_GRAY2RGB) if not args.match_rgb else query_img.copy()
                 
                 # Draw Predicted Polygon (Red)
                 cv2.polylines(img_bbox, [np.int32(dst)], True, (255, 0, 0), 10, cv2.LINE_AA)

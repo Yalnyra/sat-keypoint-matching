@@ -25,12 +25,15 @@ def detect_patch(detector, img_patch, offset_x, offset_y, max_pts):
         
     return kps
 
-def detect_window(detector, img_gray, patch_size=(4,4), max_pts=200, min_valid=0.1):
+def detect_window(detector, channels, patch_size=(4,4), max_pts=200, min_valid=0.05):
     """
     Detect fixed window
     
     """
-    h, w = img_gray.shape[:2]
+    all_kps = []
+    if isinstance(channels, np.ndarray):
+        channels = [channels]
+    h, w = channels[0].shape[:2]
     patch_h, patch_w = patch_size
     
     # How many full patches fit?
@@ -41,29 +44,27 @@ def detect_window(detector, img_gray, patch_size=(4,4), max_pts=200, min_valid=0
     # If 50px remain, we start at index 25.
     y_margin = (h - (n_rows * patch_h)) // 2
     x_margin = (w - (n_cols * patch_w)) // 2
-    
-    all_kps = []
 
-    # img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_RGB2GRAY)  
-    # --- ITERATE OVER GRID ---
-    for r in range(n_rows):
-        for c in range(n_cols):
-            # Calculate coordinates with margin offset
-            y_start = y_margin + (r * patch_h)
-            y_end = y_start + patch_h
-            
-            x_start = x_margin + (c * patch_w)
-            x_end = x_start + patch_w
-            # Extract the specific patch from the specific channel
-            patch = img_gray[y_start:y_end, x_start:x_end]
-            
-            # Calculate ratio of valid (non-zero) pixels
-            # This assumes mask is binary (0 for invalid, >0 for valid)
-            valid_pixels = np.count_nonzero(patch)
-            total_pixels = patch_h * patch_w
-            
-            if (valid_pixels / total_pixels) < min_valid:
-                continue # Skip this patch
+
+    for channel in channels:
+        for r in range(n_rows):
+            for c in range(n_cols):
+                # Calculate coordinates with margin offset
+                y_start = y_margin + (r * patch_h)
+                y_end = y_start + patch_h
+                
+                x_start = x_margin + (c * patch_w)
+                x_end = x_start + patch_w
+                # Extract the specific patch from the specific channel
+                patch = channel[y_start:y_end, x_start:x_end]
+                
+                # Calculate ratio of valid (non-zero) pixels
+                # This assumes mask is binary (0 for invalid, >0 for valid)
+                valid_pixels = np.count_nonzero(patch)
+                total_pixels = patch_h * patch_w
+                
+                if (valid_pixels / total_pixels) < min_valid:
+                    continue # Skip this patch
                     
             
             
@@ -72,7 +73,7 @@ def detect_window(detector, img_gray, patch_size=(4,4), max_pts=200, min_valid=0
             all_kps.extend(patch_kps)
     return all_kps
 
-def detect_grid(detector, img_gray, grid_size=(4,4), max_pts=200, min_valid=0.1):
+def detect_grid(detector, channels, grid_size=(4,4), max_pts=200, min_valid=0.1):
         """
         1. Splits image into RGB channels.
         2. Splits each channel into grid tiles.
@@ -81,34 +82,37 @@ def detect_grid(detector, img_gray, grid_size=(4,4), max_pts=200, min_valid=0.1)
         """
         all_kps = []
         grid_rows, grid_cols = grid_size
-        h, w = img_gray.shape[:2]
+        if isinstance(channels, np.ndarray):
+            channels = [channels]
+        h, w = channels[0].shape[:2]
         
         # Calculate cell dimensions
         step_h = h // grid_rows
         step_w = w // grid_cols
         
-        # --- ITERATE OVER GRID ---
-        for r in range(grid_rows):
-            for c in range(grid_cols):
-                # Define patch coordinates
-                y_start, y_end = r * step_h, (r + 1) * step_h
-                x_start, x_end = c * step_w, (c + 1) * step_w
 
-                patch = img_gray[y_start:y_end, x_start:x_end]
-                # --- VALIDITY CHECK ---
-                # Calculate ratio of valid (non-zero) pixels
-                # This assumes mask is binary (0 for invalid, >0 for valid)
-                valid_pixels = np.count_nonzero(patch)
-                total_pixels = step_h * step_w
-                
-                if (valid_pixels / total_pixels) < min_valid:
-                    continue # Skip this patch
+        for channel in channels:
+            for r in range(grid_rows):
+                for c in range(grid_cols):
+                    # Define patch coordinates
+                    y_start, y_end = r * step_h, (r + 1) * step_h
+                    x_start, x_end = c * step_w, (c + 1) * step_w
 
-                
-                
-                # Detect (pass absolute coordinates x_start/y_start for global mapping)
-                patch_kps = detect_patch(detector, patch, x_start, y_start, max_pts)
-                all_kps.extend(patch_kps)
+                    patch = channel[y_start:y_end, x_start:x_end]
+                    # --- VALIDITY CHECK ---
+                    # Calculate ratio of valid (non-zero) pixels
+                    # This assumes mask is binary (0 for invalid, >0 for valid)
+                    valid_pixels = np.count_nonzero(patch)
+                    total_pixels = step_h * step_w
+                    
+                    if (valid_pixels / total_pixels) < min_valid:
+                        continue # Skip this patch
+
+                    
+                    
+                    # Detect (pass absolute coordinates x_start/y_start for global mapping)
+                    patch_kps = detect_patch(detector, patch, x_start, y_start, max_pts)
+                    all_kps.extend(patch_kps)
 
         return all_kps
 
@@ -156,7 +160,7 @@ def non_max_suppression(keypoints, max_points=50, robust_coeff=0.9):
     # We query K nearest neighbors for every point.
     # K=32 is a heuristic: if the nearest stronger neighbor is further than
     # the closest 32 points, this point is practically isolated enough.
-    search_k = min(n, 32)
+    search_k = min(n, 100)
     
     # query returns (distances, neighbor_indices)
     # jobs=-1 uses all CPU cores
