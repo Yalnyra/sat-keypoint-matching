@@ -1,5 +1,6 @@
 
 import cv2
+from cv2.xfeatures2d import StarDetector, FREAK
 import numpy as np
 import time
 import pandas as pd
@@ -10,6 +11,7 @@ import sys
 import matplotlib.pyplot as plt
 from utils.detection import detect_grid, detect_window, non_max_suppression, lowe_test
 from utils.config import init_pipeline
+from utils.metrics import box_iou
 
 # load global logger
 logger = logging.getLogger(__name__)
@@ -92,13 +94,18 @@ if __name__ == "__main__":
     parser.set_defaults(nms_pts=50)
     parser.set_defaults(dpi=96)
 
-    
-    # Includes clustering penalties where applicable
-    DETECTOR_CONFIGS = {
-        
-    }
+    args = parser.parse_args()
 
-    # --- 2. Descriptor Configuration ---
+    
+    # --- GROUND TRUTH CONFIGURATION ---
+    GT_LEFT = 1855
+    GT_TOP = 3892
+    GT_WIDTH = 2971 - GT_LEFT  # 1116
+    GT_HEIGHT = 5398 - GT_TOP # 1506
+    
+    # Format: [x, y, w, h]
+    GT_BOX = [GT_LEFT, GT_TOP, GT_WIDTH, GT_HEIGHT]
+    # Includes clustering penalties where applicable
     CONFIG = {
         'detector': {
             'GFTT': {
@@ -139,8 +146,12 @@ if __name__ == "__main__":
                     'nfeatures': 2000
                 }
             },
-            # SIFT is rarely used as a detector in this context due to speed, 
-            # but can be added similarly if needed.
+            'STAR': {
+                'factory': cv2.xfeatures2d.StarDetector,
+                'params': {
+                    'suppressNonmaxSize': args.nms_pts
+                }
+            },
         },
         'descriptor':{
             'ORB': {
@@ -158,16 +169,20 @@ if __name__ == "__main__":
             'SIFT': {
                 'factory': cv2.SIFT_create,
                 'params': {}
+            },
+            'FREAK':{
+                'factory': cv2.xfeatures2d.FREAK,
+                'params': {}
             }
         }
     }
 
-    args = parser.parse_args()
 
-    detectors = ['GFTT', 'ORB', 'BRISK'] # 'AKAZE', 'FAST', 'SIFT'
+    detectors = ['GFTT','ORB', 'BRISK', 'AKAZE', 'GFFT'] # ,'AKAZE', 'FAST', 'SIFT'
     # FAST and GFTT are NOT descriptors
-    descriptors = ['SIFT', 'ORB', 'BRISK'] # 'AKAZE'
+    descriptors = ['ORB', 'BRISK', 'AKAZE']  # 'FREAK', 'AKAZE'
     matchers = ['BF', 'FLANN']
+    match_name = 'FLANN'
     
     results = []
     
@@ -179,12 +194,9 @@ if __name__ == "__main__":
         print("Error: Could not load images.")
         sys.exit()
 
-    
-    # Standard screen DPI (Dots Per Inch) is usually 96. 
-    print(f"{'Detector':<10} | {'Descriptor':<10} | {'KP (Small)':<10} | {'Matches':<8} | {'Time (s)':<8} | {'Status'}")
-    print("-" * 70)
+    print(f"{'Detector':<10} | {'Descriptor':<10} | {'X':<6} | {'Y':<6} | {'IoU_GT':<6} | {'Ratio':<5} | {'KP (Small)':<10} | {'Matches':<8} | {'Time (s)':<8} | {'Status':<8} ")
+    print("-" * 125)
 
-    # --- LOOP THROUGH PERMUTATIONS ---
     for det_name in detectors:
         for desc_name in descriptors:
             
@@ -193,7 +205,7 @@ if __name__ == "__main__":
             if desc_name == 'AKAZE' and det_name != desc_name:
                 continue
 
-            detector, extractor, matcher = init_pipeline(det_name, desc_name, matchers[0], CONFIG)
+            detector, extractor, matcher = init_pipeline(det_name, desc_name, match_name, CONFIG)
                 
             try:
                 start_time = time.time()
@@ -224,8 +236,12 @@ if __name__ == "__main__":
                     continue
 
                 # Match
-                matches = matcher.knnMatch(des_small, des_big, k=2)
-                good_matches = lowe_test(matches, ratio=1.0)
+                if match_name == 'FLANN':
+                    matches = matcher.knnMatch(des_small, des_big, k=2)
+                    good_matches = lowe_test(matches, ratio=0.85)
+
+                else:
+                    good_matches = matcher.match(des_small, des_big)
 
                 # Verify Homography (Did it actually work?)
                 status = "Fail"
@@ -236,9 +252,9 @@ if __name__ == "__main__":
                         
                     end_time = time.time()
                     duration = round(end_time - start_time, 4)
-                    
-                    print(f"{det_name:<10} | {desc_name:<10} | {len(nms_kp_small):<10} | {len(good_matches):<8} | {duration:<8} | {status}")
-                    results.append([det_name, desc_name, len(nms_kp_small), len(good_matches), duration, status])
+  
+                    print(f"{det_name:<10} | {desc_name:<10} | nan | nan | nan | nan | {len(kp_small):<10} | {len(good_matches):<8} | {duration:<8} | {status}")
+                    results.append([det_name, desc_name, np.nan, np.nan, np.nan, np.nan, len(nms_kp_small), len(good_matches), duration, status])
                     continue
 
                 status = "Success"   
@@ -292,35 +308,69 @@ if __name__ == "__main__":
                 # crop those bounding boxes
                 # using M^{-1} we go from query coordinates to template coordinates.
                 img_templ_coords = cv2.warpPerspective(query_img, np.linalg.inv(M), (w,h))
-                vis_figure(img_templ_coords, args.template_name, 'reproject', det_name, desc_name, args)
+                
+                # Finish transform calculations, moving on to metrics calculation
+                end_time = time.time()
+                duration = round(end_time - start_time, 4)
 
+                # dst[0] corresponds to pts[0] which is [0,0] (Top Left)
+                top_left_x = int(dst[0][0][0])
+                top_left_y = int(dst[0][0][1])
+
+
+                # boundingRect returns (x, y, w, h)
+                pred_x, pred_y, pred_w, pred_h = cv2.boundingRect(dst)
+                pred_box = [pred_x, pred_y, pred_w, pred_h]
+                
+                top_left_x = pred_x
+                top_left_y = pred_y
+
+                # Compute IoU (Ground Truth vs Prediction) ---
+                iou_gt = round(box_iou(pred_box, GT_BOX), 3)
+
+                # Area Ratio
+                projected_area = abs(cv2.contourArea(dst))
+                template_area = float(h * w)
+                
+                area_ratio = -1
+                if projected_area > 0:
+                    area_ratio = round(template_area / projected_area, 3)
+                
+                # --- Visualization ---
+                img_bbox = cv2.cvtColor(query_img, cv2.COLOR_GRAY2RGB)
+                
+                # Draw Predicted Polygon (Red)
+                cv2.polylines(img_bbox, [np.int32(dst)], True, (255, 0, 0), 10, cv2.LINE_AA)
+                
+                # Draw Predicted Bounding Rect (Yellow) - optional, helps visualize what we measured
+                cv2.rectangle(img_bbox, (pred_x, pred_y), (pred_x + pred_w, pred_y + pred_h), (0, 255, 255), 3)
+                
+                # Draw Ground Truth Rect (Green) - so you can compare visually
+                cv2.rectangle(img_bbox, (GT_BOX[0], GT_BOX[1]), (GT_BOX[0] + GT_BOX[2], GT_BOX[1] + GT_BOX[3]), (0, 255, 0), 3)
                 if args.view_matches:
-                    # draw the rectangle in the image
-                    out = cv2.polylines(query_img,[np.int32(dst)],True,0,2, cv2.LINE_AA)
                     # show the matching features
-                    params = dict(matchColor = (0,255,0), # draw matches in green color
+                    params = dict(matchColor = (255,0,0), # draw matches in green color
                                     singlePointColor = None,
                                     matchesMask = matchesMask, # draw only inliers
                                     flags = 2)
                     ## draw the matches image 
-                    out = cv2.drawMatches(template_img, nms_kp_small,
-                                            query_img, nms_kp_big,
+                    img_bbox = cv2.drawMatches(template_img, nms_kp_small,
+                                            img_bbox, nms_kp_big,
                                             good_matches, 
                                             None, **params)
                     
-                    vis_figure(out, args.template_name, 'match', det_name, desc_name, args)
+                    
+                vis_figure(img_bbox, args.template_name, 'match', det_name, desc_name, args)
                 
-                end_time = time.time()
-                duration = round(end_time - start_time, 4)
                 
-                print(f"{det_name:<10} | {desc_name:<10} | {len(nms_kp_small):<10} | {len(good_matches):<8} | {duration:<8} | {status}")
-                results.append([det_name, desc_name, len(nms_kp_small), len(good_matches), duration, status])
+                print(f"{det_name:<10} | {desc_name:<10} | {top_left_x:<6} | {top_left_y:<6} | {iou_gt:<6} | {area_ratio:<5} | {len(kp_small):<10} | {len(good_matches):<8} | {duration:<8} | {status}")
+                results.append([det_name, desc_name, top_left_x, top_left_y, iou_gt, area_ratio, len(nms_kp_small), len(good_matches), duration, status])
 
             except Exception as e:
-                print(f"{det_name} + {desc_name} Failed: {e}")
+                print(f"{det_name} + {desc_name} Failed: {e}") 
                     
-    df = pd.DataFrame(results, columns=["Detector", "Descriptor", "KP_Count", "Good_Matches", "Time", "Status"])
-    df = df.sort_values(by="Good_Matches", ascending=False)
+    df = pd.DataFrame(results, columns=["Detector", "Descriptor", "Top left X", "Top left Y", "IoU score", "Area ratio", "KP count", "Good matches", "Time", "Status"])
+    df = df.sort_values(by="Good matches", ascending=False)
     print("\nSummary Sorted by Matches:")
     print(df)
     df.to_csv('{}/report.csv'.format(args.output_path))
