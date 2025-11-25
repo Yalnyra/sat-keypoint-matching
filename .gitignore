@@ -1,4 +1,4 @@
 /data
 /out
 /report
-/__pycache__
+*__pycache__

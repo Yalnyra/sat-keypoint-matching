@@ -1,1 +1,1 @@
-from .detection import detect_grid, detect_window, knn_match, non_max_suppression, opponent_desc, to_opponent_space
+from .detection import detect_grid, detect_window, lowe_test, non_max_suppression, opponent_desc, to_opponent_space

@@ -8,28 +8,12 @@ import logging
 import os 
 import sys
 import matplotlib.pyplot as plt
-from utils.detection import detect_grid, detect_window, knn_match, non_max_suppression
+from utils.detection import detect_grid, detect_window, non_max_suppression, lowe_test
+from utils.config import init_pipeline
 
 # load global logger
 logger = logging.getLogger(__name__)
 logging.basicConfig(format='%(asctime)s %(message)s')
-
-# calculate the angle with the horizontal
-def angle_horizontal(v):
-    return -np.arctan2(v[1],v[0])
-
-def knn_clasif(good_matches):
-  best_template, highest_logprob = None, 0.0
-
-  sum_good_matches = sum([len(gm) for gm in good_matches])
-  for i, gm in enumerate(good_matches):
-    logprob = len(gm)/sum_good_matches
-    # save highest
-    if logprob > highest_logprob:
-      highest_logprob = logprob
-      best_template = i
-    logger.info('p(t_{} | x) = {:.4f}'.format(i, logprob))
-  return best_template
 
 def vis_figure(img, base, name, det_name, desc_name, args, patch_size=None, draw_grid=False):
     bn, ext = os.path.splitext(os.path.basename(base))
@@ -93,14 +77,12 @@ if __name__ == "__main__":
     parser.add_argument('-q', dest='query_name', required=True, help='Query image')
     parser.add_argument('-o', dest='output_path', help='Output directory', default='.')
     parser.add_argument('-v', dest='verbosity', action='store_true', help='Increase output verbosity')
-    parser.add_argument('-p', dest='photocopied', action='store_true', help='Use only if the image is scanned or photocopied, do not with photos!')
+    parser.add_argument('-p', dest='photocopied', action='store_true', help='Removes shear from affine2d transform, Use only if the image is scanned')
     parser.add_argument('--matches', dest='view_matches', action='store_true', help="Shows the matching result and the good matches")
     parser.add_argument('--tres', dest='treshold', type=int, help='Minimum good matches to pass the validation test')
     parser.add_argument('--grid', dest='patch_size', type=int, help='Width in pixels of the window in the detection grid')
     parser.add_argument('--pts', dest='max_pts', type=int, help='Maximum number of detection points in a single patch')
     parser.add_argument('--nms', dest='nms_pts', type=int, help='Maximum number of Non Max Suppression points')
-
-
 
     parser.set_defaults(view_matches=False)
     parser.set_defaults(photocopied=False)
@@ -108,29 +90,85 @@ if __name__ == "__main__":
     parser.set_defaults(patch_size=240)
     parser.set_defaults(max_pts=400)
     parser.set_defaults(nms_pts=50)
-    
-
     parser.set_defaults(dpi=96)
+
+    
+    # Includes clustering penalties where applicable
+    DETECTOR_CONFIGS = {
+        
+    }
+
+    # --- 2. Descriptor Configuration ---
+    CONFIG = {
+        'detector': {
+            'GFTT': {
+            'factory': cv2.GFTTDetector_create,
+            'params': {
+                'maxCorners': 1000,
+                'qualityLevel': 0.01,
+                'minDistance': 20  # Clustering penalty
+            }
+            },
+            'AKAZE': {
+                'factory': cv2.AKAZE_create,
+                'params': {
+                    'threshold': 0.001,
+                    'nOctaves': 4,
+                    'nOctaveLayers': 4,
+                    'diffusivity': cv2.KAZE_DIFF_CHARBONNIER # Clustering penalty (better localization)
+                }
+            },
+            'FAST': {
+                'factory': cv2.FastFeatureDetector_create,
+                'params': {
+                    'threshold': 20,
+                    'nonmaxSuppression': True, # Clustering penalty
+                    'type': cv2.FAST_FEATURE_DETECTOR_TYPE_9_16
+                }
+            },
+            'BRISK': {
+                'factory': cv2.BRISK_create,
+                'params': {
+                    'thresh': 30, # Clustering penalty (noise reduction)
+                    'octaves': 3
+                }
+            },
+            'ORB': {
+                'factory': cv2.ORB_create,
+                'params': {
+                    'nfeatures': 2000
+                }
+            },
+            # SIFT is rarely used as a detector in this context due to speed, 
+            # but can be added similarly if needed.
+        },
+        'descriptor':{
+            'ORB': {
+                'factory': cv2.ORB_create,
+                'params': {}
+            },
+            'BRISK': {
+                'factory': cv2.BRISK_create,
+                'params': {}
+            },
+            'AKAZE': {
+                'factory': cv2.AKAZE_create,
+                'params': {}
+            },
+            'SIFT': {
+                'factory': cv2.SIFT_create,
+                'params': {}
+            }
+        }
+    }
 
     args = parser.parse_args()
 
-    detectors = {
-            # 'SIFT': cv2.SIFT_create(nfeatures=2000),
-            'ORB': cv2.ORB_create(nfeatures=2000),
-            'BRISK': cv2.BRISK_create(),
-            # 'AKAZE': cv2.AKAZE_create(),
-            # 'FAST': cv2.FastFeatureDetector_create(threshold=20),
-            'GFTT': cv2.GFTTDetector_create(maxCorners=2000) # Shi-Tomasi
-        }
-
-    # Note: FAST and GFTT are NOT descriptors, so they aren't in this list.
-    descriptors = {
-        'SIFT': cv2.SIFT_create(),
-        'ORB': cv2.ORB_create(),
-        'BRISK': cv2.BRISK_create(),
-        # 'AKAZE': cv2.AKAZE_create()
-    }
-
+    detectors = ['GFTT', 'ORB', 'BRISK'] # 'AKAZE', 'FAST', 'SIFT'
+    # FAST and GFTT are NOT descriptors
+    descriptors = ['SIFT', 'ORB', 'BRISK'] # 'AKAZE'
+    matchers = ['BF', 'FLANN']
+    
     results = []
     
     # Load Images
@@ -147,13 +185,15 @@ if __name__ == "__main__":
     print("-" * 70)
 
     # --- LOOP THROUGH PERMUTATIONS ---
-    for det_name, detector in detectors.items():
-        for desc_name, extractor in descriptors.items():
+    for det_name in detectors:
+        for desc_name in descriptors:
             
             # Skip incompatible combinations
             # AKAZE Descriptor only works with AKAZE Keypoints (usually)
             if desc_name == 'AKAZE' and det_name != desc_name:
                 continue
+
+            detector, extractor, matcher = init_pipeline(det_name, desc_name, matchers[0], CONFIG)
                 
             try:
                 start_time = time.time()
@@ -183,14 +223,15 @@ if __name__ == "__main__":
                     results.append([det_name, desc_name, len(nms_kp_small), 0, 0, "Fail: No Desc"])
                     continue
 
-                # Match (Added non max suppression)
-                good_matches = knn_match(desc_name, des_small, des_big)
+                # Match
+                matches = matcher.knnMatch(des_small, des_big, k=2)
+                good_matches = lowe_test(matches, ratio=1.0)
 
                 # Verify Homography (Did it actually work?)
                 status = "Fail"
                 src_pts = np.float32([nms_kp_small[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
                 dst_pts = np.float32([nms_kp_big[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                M, mask = cv2.estimateAffine2D(src_pts, dst_pts, None, cv2.RANSAC, 5.0)
                 if M is None or len(good_matches) <= args.treshold:
                         
                     end_time = time.time()
@@ -203,10 +244,9 @@ if __name__ == "__main__":
                 status = "Success"   
                 matchesMask = mask.ravel().tolist()
 
-                # Make it affine
-                M[2,2] = 1.0
-                M[2,0] = 0.0
-                M[2,1] = 0.0
+                # Make the perspective 3x3 matrix affine (2x3)
+                row_to_add = np.array([0.0, 0.0, 1.0])
+                M = np.vstack((M, row_to_add))
 
                 # Calculate the rectangle enclosing the query image
                 h,w = template_img.shape
@@ -234,7 +274,7 @@ if __name__ == "__main__":
                     # see https://upload.wikimedia.org/wikipedia/commons/2/2c/2D_affine_transformation_matrix.svg
                     
                     # estimate the angle using the top-horizontal line
-                    angle = angle_horizontal(w_vp)
+                    angle = -np.arctan2(w_vp[1],h_vp[0])
                     
                     # estimate the scale using the top-horizontal line and left-vertical line
                     scale_x = np.linalg.norm(w_vp) / np.linalg.norm(w_v)

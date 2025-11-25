@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from scipy.spatial import KDTree
 
 ### Author: Eugen Vinokur 24/11/2025
 ### Clustering-discouraging keypoint detections methods
@@ -111,54 +112,30 @@ def detect_grid(detector, img_gray, grid_size=(4,4), max_pts=200, min_valid=0.1)
 
         return all_kps
 
-
-def get_norm(desc_name):
-    # Binary descriptors need HAMMING, Floats need L2
-    if desc_name in ['ORB', 'BRISK', 'AKAZE', 'BRIEF']:
-        return cv2.NORM_HAMMING
-    return cv2.NORM_L2
-
-def lowe_test(matches, nn_ratio=0.7):
-    # store only the good matches as per Lowe's ratio test.
-    good = []
-    for m, n in matches:
-        if m.distance < nn_ratio * n.distance:
-            good.append(m)
-
-    return good
-
-def knn_match(desc_name, des1, des2):
-  
-    # FLANN parameters
-    index_params = dict(algorithm = 0, trees = 5)
-    search_params = dict(checks = 50)
-
-    norm = get_norm(desc_name)
-    # Configure Matcher
-    if norm == cv2.NORM_HAMMING:
-        index_params = dict(algorithm=6, table_number=6, key_size=12, multi_probe_level=1)
-    else:
-        index_params = dict(algorithm=1, trees=5)
-
-    flann = cv2.FlannBasedMatcher(index_params, search_params)
-    
-    # Match features from each image
-    matches = flann.knnMatch(des1, des2, k=2)
-
-    if desc_name == 'SIFT':
-        return lowe_test(matches, 0.7)
-    else:
-        return lowe_test(matches, 1.0)
-    
-
-def non_max_suppression(keypoints, max_points=50):
+def lowe_test(matches, ratio):
     """
-    Implements simplified ANMS (Brown et al.).
-    1. Sorts points by response (strength).
-    2. For every point, finds the distance to the nearest *stronger* point.
-    3. Selects points that have the largest distance to their stronger neighbors.
+    Robust Lowe's Ratio Test that handles missing neighbors.
     """
-    if len(keypoints) <= max_points:
+    good_matches = []
+    
+    # Do not use "for m, n in matches" here. 
+    # It assumes strictly 2 values and will crash on LSH results.
+    for match in matches:
+        # Check if we actually found 2 neighbors
+        if len(match) == 2:
+            m, n = match
+            if m.distance < ratio * n.distance:
+                good_matches.append(m)
+    return good_matches
+    
+def non_max_suppression(keypoints, max_points=50, robust_coeff=0.9):
+    """
+    Optimized ANMS using Scipy KD-Tree (Approximate).
+    
+    Complexity: O(N log N) build + O(N * K) query
+    """
+    n = len(keypoints)
+    if n <= max_points:
         return keypoints
 
     # 1. Extract coordinates and responses
@@ -166,29 +143,48 @@ def non_max_suppression(keypoints, max_points=50):
     responses = np.array([kp.response for kp in keypoints])
 
     # 2. Sort by response (descending)
-    # We want the strongest points first to serve as "anchors"
+    # Strongest points come first (index 0 is strongest)
     idxs = np.argsort(responses)[::-1]
     pts = pts[idxs]
-    original_indices = idxs # Keep track to return correct KeyPoint objects
+    responses = responses[idxs] # Needed for robust coefficient check
+    original_indices = idxs 
 
-    # Calculate suppression radius for each point
-    n = len(pts)
-    radii = np.full(n, np.inf)
+    # 3. KD-Tree Optimization
+    # We build the tree once on all points.
+    tree = KDTree(pts)
     
-    # Note: This is O(N^2) worst case. For production with >5000 points, 
-    # use a KD-Tree (scipy.spatial.cKDTree).
-    for i in range(1, n):
-        # Compare point i with all stronger points (0 to i-1)
-        # We add a small robust multiplier (0.9) to ensure we only respect 
-        # neighbors that are strictly stronger/equal, handling floating point drift.
-        
-        # Calculate Euclidean distances to all stronger points
-        dist_sq = np.sum((pts[:i] - pts[i])**2, axis=1)
-        
-        # The radius is the minimum distance to a stronger point
-        radii[i] = np.min(dist_sq)
+    # We query K nearest neighbors for every point.
+    # K=32 is a heuristic: if the nearest stronger neighbor is further than
+    # the closest 32 points, this point is practically isolated enough.
+    search_k = min(n, 32)
+    
+    # query returns (distances, neighbor_indices)
+    # jobs=-1 uses all CPU cores
+    dists, neighbor_idxs = tree.query(pts, k=search_k, workers=-1)
 
-    # Select top k points with the largest suppression radii
+    # 4. Compute Suppression Radii
+    radii = np.full(n, np.inf)
+
+    # Iterate through the pre-computed neighbors to find the first "stronger" one
+    # Note: Vectorizing this completely is hard because the "stop condition" 
+    # (finding the first valid neighbor) varies per row. A fast loop is preferred.
+    for i in range(1, n):
+        # The neighbors are already sorted by distance by cKDTree
+        row_indices = neighbor_idxs[i]
+        row_dists = dists[i]
+        
+        for k in range(1, search_k): # Skip k=0 (self)
+            neighbor_idx = row_indices[k]
+            
+            # CONDITION: Is the neighbor "stronger"?
+            # Since we sorted 'pts' by response descending, a lower index 
+            # usually means higher response. 
+            # We explicitly check the robust coefficient logic: R_neighbor > R_i * 0.9
+            if responses[neighbor_idx] > responses[i] * robust_coeff:
+                radii[i] = row_dists[k]
+                break 
+
+    # 5. Select top k points with the largest suppression radii
     best_indices = np.argsort(radii)[::-1][:max_points]
     
     # Map back to original keypoint objects
